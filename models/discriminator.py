@@ -79,9 +79,9 @@ class SpectralNorm(nn.Module):
 
 
 def add_spectral_norm(module: nn.Module) -> nn.Module:
-    """Add spectral normalization to a module"""
+    """Add spectral normalization - FIXED for mixed precision"""
     if isinstance(module, (nn.Conv2d, nn.Linear)):
-        return SpectralNorm(module)
+        return nn.utils.spectral_norm(module)  # Use PyTorch's built-in
     return module
 
 
