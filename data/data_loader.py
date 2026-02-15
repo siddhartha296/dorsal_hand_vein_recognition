@@ -1,6 +1,6 @@
 """
-Data loader for Dorsal Hand Vein Images
-Handles loading, preprocessing, and batching of the vein image dataset
+FIXED Data loader for Dorsal Hand Vein Images
+This version correctly handles tensor dimensions
 """
 import os
 import re
@@ -12,14 +12,13 @@ from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 from PIL import Image
 import cv2
-from sklearn.model_selection import train_test_split
 
 from config import config
 
 
 class DorsalHandVeinDataset(Dataset):
     """
-    PyTorch Dataset for Dorsal Hand Vein Images
+    PyTorch Dataset for Dorsal Hand Vein Images - FIXED VERSION
     
     Supports both Database 1 and Database 2
     Naming convention: person_[xxx]_db[1|2]_[L|R][1-4].tif
@@ -106,7 +105,7 @@ class DorsalHandVeinDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict]:
         """
         Returns:
-            image: Preprocessed image tensor
+            image: Preprocessed image tensor of shape (1, H, W)
             metadata: Dictionary with image metadata
         """
         data = self.image_data[idx]
@@ -121,6 +120,10 @@ class DorsalHandVeinDataset(Dataset):
         # Convert to tensor and normalize
         image = self._preprocess_image(image)
         
+        # CRITICAL: Verify shape before returning
+        assert image.ndim == 3, f"Expected 3D tensor, got {image.ndim}D: {image.shape}"
+        assert image.shape[0] == 1, f"Expected 1 channel, got {image.shape[0]}: {image.shape}"
+        
         # Prepare metadata
         metadata = {
             'person_id': data['person_id'],
@@ -132,10 +135,24 @@ class DorsalHandVeinDataset(Dataset):
         return image, metadata
     
     def _load_image(self, path: Path) -> np.ndarray:
-        """Load 16-bit TIFF image"""
+        """
+        Load 16-bit TIFF image
+        Returns: numpy array of shape (H, W) - 2D grayscale
+        """
         # Using PIL for TIFF loading
         img = Image.open(path)
+        
+        # Convert to grayscale if not already
+        if img.mode != 'L':
+            img = img.convert('L')
+        
+        # Convert to numpy array
         img_array = np.array(img, dtype=np.float32)
+        
+        # CRITICAL: Ensure 2D array
+        if img_array.ndim == 3:
+            # If 3D, take first channel
+            img_array = img_array[:, :, 0]
         
         # Resize if necessary
         if img_array.shape[:2] != self.image_size:
@@ -148,18 +165,55 @@ class DorsalHandVeinDataset(Dataset):
         return img_array
     
     def _preprocess_image(self, image: np.ndarray) -> torch.Tensor:
-        """Preprocess image to tensor"""
+        """
+        Preprocess image to tensor - FIXED VERSION
+        
+        Input: numpy array of shape (H, W) - grayscale image
+        Output: tensor of shape (1, H, W) - single channel
+        """
+        # CRITICAL: Ensure image is 2D (H, W)
+        if image.ndim == 3:
+            # If accidentally loaded as RGB, convert to grayscale
+            if image.shape[2] == 3:
+                # Take mean across channels
+                image = image.mean(axis=2)
+            elif image.shape[2] == 1:
+                # Remove extra dimension
+                image = image.squeeze(2)
+            else:
+                # Take first channel
+                image = image[:, :, 0]
+        
+        # Ensure still 2D after operations
+        while image.ndim > 2:
+            image = image.squeeze()
+        
+        if image.ndim < 2:
+            raise ValueError(f"Image has invalid dimensions: {image.shape}")
+        
         # Normalize to [0, 1]
-        image = image / image.max() if image.max() > 0 else image
+        if image.max() > 0:
+            image = image / image.max()
         
         # Normalize to [-1, 1] if specified (for GAN training)
         if self.normalize:
             image = image * 2.0 - 1.0
         
-        # Add channel dimension and convert to tensor
-        image = torch.from_numpy(image).unsqueeze(0).float()
+        # Convert to tensor
+        image_tensor = torch.from_numpy(image).float()
         
-        return image
+        # CRITICAL: Add channel dimension to get (1, H, W)
+        if image_tensor.ndim == 2:
+            image_tensor = image_tensor.unsqueeze(0)  # (H, W) -> (1, H, W)
+        
+        # Final verification
+        if image_tensor.ndim != 3 or image_tensor.shape[0] != 1:
+            raise ValueError(
+                f"Tensor has wrong shape: {image_tensor.shape}. "
+                f"Expected (1, H, W)"
+            )
+        
+        return image_tensor
     
     def get_person_images(self, person_id: int) -> List[int]:
         """Get all image indices for a specific person"""
@@ -248,97 +302,52 @@ def create_data_loaders(
     print(f"  Val: {len(val_dataset)} samples ({len(val_loader)} batches)")
     print(f"  Test: {len(test_dataset)} samples ({len(test_loader)} batches)")
     
+    # CRITICAL: Verify data shapes
+    _verify_dataloader_output(train_loader)
+    
     return train_loader, val_loader, test_loader
 
 
-def get_paired_verification_loader(
-    db_paths: List[Path],
-    batch_size: int = None,
-    num_pairs: int = 1000
-) -> DataLoader:
-    """
-    Create a data loader for verification tasks with positive/negative pairs
+def _verify_dataloader_output(data_loader: DataLoader):
+    """Verify that dataloader produces correctly shaped tensors"""
+    print("\n" + "="*60)
+    print("VERIFYING DATALOADER OUTPUT")
+    print("="*60)
     
-    Args:
-        db_paths: List of database paths
-        batch_size: Batch size
-        num_pairs: Number of pairs to generate
+    batch, metadata = next(iter(data_loader))
     
-    Returns:
-        DataLoader with pairs
-    """
-    from torch.utils.data import TensorDataset
+    print(f"Batch shape: {batch.shape}")
+    print(f"Expected: (batch_size, 1, H, W)")
+    print(f"Value range: [{batch.min():.3f}, {batch.max():.3f}]")
     
-    batch_size = batch_size or config.BATCH_SIZE
+    # Critical assertions
+    assert batch.ndim == 4, f"Expected 4D batch tensor, got {batch.ndim}D: {batch.shape}"
+    assert batch.shape[1] == 1, f"Expected 1 channel, got {batch.shape[1]}"
+    assert batch.shape[2:] == config.IMAGE_SIZE, f"Wrong spatial dimensions: {batch.shape[2:]}"
     
-    # Load dataset
-    dataset = DorsalHandVeinDataset(db_paths)
-    
-    # Generate pairs
-    pairs_1, pairs_2, labels = [], [], []
-    
-    person_ids = list(set(d['person_id'] for d in dataset.image_data))
-    
-    for _ in range(num_pairs):
-        # Positive pair (same person)
-        if np.random.rand() < 0.5:
-            person_id = np.random.choice(person_ids)
-            person_images = dataset.get_person_images(person_id)
-            
-            if len(person_images) >= 2:
-                idx1, idx2 = np.random.choice(person_images, 2, replace=False)
-                img1, _ = dataset[idx1]
-                img2, _ = dataset[idx2]
-                
-                pairs_1.append(img1)
-                pairs_2.append(img2)
-                labels.append(1)  # Same person
-        
-        # Negative pair (different persons)
-        else:
-            person1, person2 = np.random.choice(person_ids, 2, replace=False)
-            images1 = dataset.get_person_images(person1)
-            images2 = dataset.get_person_images(person2)
-            
-            idx1 = np.random.choice(images1)
-            idx2 = np.random.choice(images2)
-            
-            img1, _ = dataset[idx1]
-            img2, _ = dataset[idx2]
-            
-            pairs_1.append(img1)
-            pairs_2.append(img2)
-            labels.append(0)  # Different persons
-    
-    # Create tensor dataset
-    pairs_1 = torch.stack(pairs_1)
-    pairs_2 = torch.stack(pairs_2)
-    labels = torch.tensor(labels, dtype=torch.float32)
-    
-    pair_dataset = TensorDataset(pairs_1, pairs_2, labels)
-    
-    pair_loader = DataLoader(
-        pair_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=config.NUM_WORKERS
-    )
-    
-    return pair_loader
+    print("✓ Dataloader output verification PASSED")
+    print("="*60 + "\n")
 
 
 if __name__ == "__main__":
     # Test the data loader
-    print("Testing Dorsal Hand Vein Data Loader...")
+    print("Testing FIXED Dorsal Hand Vein Data Loader...")
     
     # Example usage
     db_paths = [config.DB1_PATH, config.DB2_PATH]
     
-    # Create data loaders
-    train_loader, val_loader, test_loader = create_data_loaders(db_paths)
-    
-    # Test loading a batch
-    batch, metadata = next(iter(train_loader))
-    print(f"\nBatch shape: {batch.shape}")
-    print(f"Batch min/max: {batch.min():.3f} / {batch.max():.3f}")
-    print(f"Metadata keys: {metadata.keys()}")
+    try:
+        # Create data loaders
+        train_loader, val_loader, test_loader = create_data_loaders(db_paths)
+        
+        # Test loading a batch
+        batch, metadata = next(iter(train_loader))
+        print(f"\n✓ SUCCESS!")
+        print(f"Batch shape: {batch.shape}")
+        print(f"Batch min/max: {batch.min():.3f} / {batch.max():.3f}")
+        print(f"Metadata keys: {metadata.keys()}")
+        
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
