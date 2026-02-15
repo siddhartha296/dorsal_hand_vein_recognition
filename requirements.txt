@@ -1,3 +1,4 @@
+# GAN and Core Libraries
 torch>=2.0.0
 torchvision>=0.15.0
 numpy>=1.24.0
@@ -13,7 +14,7 @@ tqdm>=4.65.0
 # Explainability libraries
 shap>=0.42.0
 lime>=0.2.0.1
-pytorch-grad-cam>=1.4.8
+grad-cam>=1.4.8
 
 # Additional utilities
 pandas>=2.0.0
