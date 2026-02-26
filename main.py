@@ -1,6 +1,12 @@
 """
 Main execution script for XAI-Enhanced GAN for Dorsal Hand Vein Authentication
-Enhanced version with comprehensive evaluation and XAI analysis
+Fixed version:
+  - Robust _get_num_unique_persons that doesn't assume dataset wrapping structure
+  - VeinGAN device placement not doubled
+  - Authentication labels remapped to classifier indices (0..N-1)
+  - GRADCAM_TARGET_LAYER corrected to match VeinAuthenticationClassifier layer names
+  - LIME visualize_explanation called with required segments argument
+  - Consistent data loader unpacking across all methods
 """
 import argparse
 import torch
@@ -26,43 +32,60 @@ from training.train import VeinGANTrainer
 from visualization.visualize import plot_vein_batch, compare_real_fake
 
 
+# FIX 4: Correct target layer name to match VeinAuthenticationClassifier
+# The classifier uses conv1/conv2/conv3/conv4, not 'layer4'.
+# 'conv4' is the deepest conv block — best for Grad-CAM.
+GRADCAM_TARGET_LAYER = 'conv4'
+
+
 class XAIVeinGANPipeline:
     """
     Complete pipeline for XAI-Enhanced Vein GAN
     Handles training, evaluation, generation, and explainability analysis
     """
-    
+
     def __init__(self, args):
         self.args = args
+
+        # FIX 2: Don't call .to(self.device) on VeinGAN — it handles device
+        # placement internally in __init__. We just store the device reference.
         self.device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
-        
+
         # Create output directories
         self._setup_directories()
-        
+
         # Initialize data loaders
         print("Loading datasets...")
         self.train_loader, self.val_loader, self.test_loader = self._load_data()
-        
+
         # Initialize models
         print("Initializing models...")
-        self.gan = VeinGAN().to(self.device)
-        
-        # Determine number of unique persons for classifier
-        self.num_persons = self._get_num_unique_persons()
+        # FIX 2: No .to(self.device) here — VeinGAN moves submodules itself
+        self.gan = VeinGAN()
+
+        # FIX 1 & 3: Get unique persons and build a stable label→index map.
+        # This map is used during authentication evaluation so that raw
+        # person_id values (which may not be 0-indexed) are correctly
+        # remapped to classifier output indices.
+        self.num_persons, self.person_id_to_idx = self._get_num_unique_persons()
+        print(f"  Found {self.num_persons} unique persons")
+
         self.classifier = VeinAuthenticationClassifier(
             num_classes=self.num_persons
         ).to(self.device)
-        
+
         # Load checkpoint if provided
         if args.checkpoint and os.path.exists(args.checkpoint):
             self._load_checkpoint(args.checkpoint)
-        
+
         print(f"\n{'='*60}")
         print(f"XAI-Enhanced Vein GAN Pipeline Initialized")
         print(f"Device: {self.device}")
         print(f"Mode: {args.mode}")
         print(f"{'='*60}\n")
-    
+
+    # ==================== Setup ====================
+
     def _setup_directories(self):
         """Create necessary output directories"""
         dirs = [
@@ -76,7 +99,7 @@ class XAIVeinGANPipeline:
         ]
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
-    
+
     def _load_data(self) -> Tuple:
         """Load train, validation, and test data loaders"""
         db_paths = []
@@ -84,29 +107,90 @@ class XAIVeinGANPipeline:
             db_paths.append(config.DB1_PATH)
         if config.DB2_PATH.exists():
             db_paths.append(config.DB2_PATH)
-        
+
         if not db_paths:
             raise FileNotFoundError(
                 f"No dataset found! Please ensure data is in:\n"
                 f"  - {config.DB1_PATH}\n"
                 f"  - {config.DB2_PATH}"
             )
-        
+
         return create_data_loaders(db_paths)
-    
-    def _get_num_unique_persons(self) -> int:
-        """Get number of unique persons in dataset"""
-        dataset = self.train_loader.dataset.dataset
-        person_ids = set(d['person_id'] for d in dataset.image_data)
-        return len(person_ids)
-    
+
+    def _get_num_unique_persons(self) -> Tuple[int, Dict]:
+        """
+        Get number of unique persons and build a person_id -> classifier index map.
+
+        FIX 1: The original code assumed self.train_loader.dataset.dataset.image_data
+        which crashes if the wrapping structure differs. We now walk up the .dataset
+        chain until we find an object with image_data, or fall back to iterating
+        the loader itself.
+
+        FIX 3: Returns a stable sorted mapping so that person_id values (which may
+        be arbitrary integers or strings) are always mapped to the same 0-indexed
+        classifier output slot.
+        """
+        # Try to find the underlying dataset with image_data attribute
+        dataset = self.train_loader.dataset
+        for _ in range(5):  # unwrap up to 5 levels of wrapping
+            if hasattr(dataset, 'image_data'):
+                break
+            if hasattr(dataset, 'dataset'):
+                dataset = dataset.dataset
+            else:
+                dataset = None
+                break
+
+        person_ids = set()
+
+        if dataset is not None and hasattr(dataset, 'image_data'):
+            for d in dataset.image_data:
+                pid = d['person_id']
+                # Normalize to int if possible
+                try:
+                    pid = int(pid)
+                except (ValueError, TypeError):
+                    pass
+                person_ids.add(pid)
+        else:
+            # Fallback: iterate one epoch of the train loader to collect ids
+            print("  ⚠ Could not access image_data directly, scanning train loader...")
+            for _, metadata in self.train_loader:
+                if isinstance(metadata, dict):
+                    for pid in metadata['person_id']:
+                        try:
+                            pid = int(pid)
+                        except (ValueError, TypeError):
+                            pass
+                        person_ids.add(pid)
+                else:
+                    # metadata is just a label tensor
+                    for pid in metadata.tolist():
+                        person_ids.add(pid)
+
+        # Build a stable sorted mapping: person_id -> 0-indexed class label
+        sorted_ids = sorted(person_ids, key=lambda x: (str(type(x)), str(x)))
+        person_id_to_idx = {pid: idx for idx, pid in enumerate(sorted_ids)}
+
+        return len(person_ids), person_id_to_idx
+
+    def _resolve_label(self, person_id) -> int:
+        """
+        Convert a raw person_id to its 0-indexed classifier label.
+        FIX 3: Ensures labels passed to accuracy calculation are valid indices.
+        """
+        try:
+            person_id = int(person_id)
+        except (ValueError, TypeError):
+            pass
+        return self.person_id_to_idx.get(person_id, 0)
+
     def _load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint"""
         try:
             self.gan.load_checkpoint(checkpoint_path)
             print(f"✓ Loaded GAN checkpoint from {checkpoint_path}")
-            
-            # Try to load classifier checkpoint if it exists
+
             classifier_path = Path(checkpoint_path).parent / 'classifier_best.pth'
             if classifier_path.exists():
                 state = torch.load(classifier_path, map_location=self.device)
@@ -114,7 +198,9 @@ class XAIVeinGANPipeline:
                 print(f"✓ Loaded Classifier checkpoint from {classifier_path}")
         except Exception as e:
             print(f"⚠ Warning: Error loading checkpoint: {e}")
-    
+
+    # ==================== Mode Dispatch ====================
+
     def run(self):
         """Run the pipeline based on specified mode"""
         if self.args.mode == 'train':
@@ -127,251 +213,239 @@ class XAIVeinGANPipeline:
             self.xai_mode()
         else:
             raise ValueError(f"Unknown mode: {self.args.mode}")
-    
+
+    # ==================== Train ====================
+
     def train_mode(self):
-        """Training mode - trains the GAN"""
         print("\n" + "="*60)
         print("TRAINING MODE")
         print("="*60 + "\n")
-        
+
         trainer = VeinGANTrainer(
             self.gan,
             self.train_loader,
             self.val_loader
         )
-        
+
         print(f"Starting training for {config.NUM_EPOCHS} epochs...")
         trainer.train()
-        
+
         print("\n✓ Training completed!")
         print(f"Checkpoints saved in: {config.CHECKPOINT_DIR}")
-    
+
+    # ==================== Evaluate ====================
+
     def evaluate_mode(self):
-        """Comprehensive evaluation mode"""
         print("\n" + "="*60)
         print("EVALUATION MODE")
         print("="*60 + "\n")
-        
+
         self.gan.generator.eval()
         self.gan.discriminator.eval()
         self.classifier.eval()
-        
-        # 1. Quality Metrics
+
         print("1. Evaluating Image Quality Metrics...")
         quality_results = self._evaluate_quality_metrics()
         self._save_results(quality_results, 'quality_metrics.txt')
-        
-        # 2. Authentication Performance
+
         print("\n2. Evaluating Authentication Performance...")
         auth_results = self._evaluate_authentication()
         self._save_results(auth_results, 'authentication_metrics.txt')
-        
-        # 3. Fairness Analysis
+
         print("\n3. Performing Fairness Analysis...")
         fairness_results = self._evaluate_fairness()
         self._save_results(fairness_results, 'fairness_analysis.txt')
-        
-        # 4. Visual Comparison
+
         print("\n4. Generating Visual Comparisons...")
         self._generate_comparisons()
-        
+
         print("\n" + "="*60)
         print("EVALUATION SUMMARY")
         print("="*60)
         print(f"\n✓ All evaluation results saved in: {config.RESULTS_DIR}")
         self._print_summary(quality_results, auth_results, fairness_results)
-    
+
     def _evaluate_quality_metrics(self) -> Dict:
-        """Evaluate image quality metrics (FID, IS, SSIM, PSNR)"""
         metrics_calc = VeinMetrics(device=self.device)
-        results = {
-            'ssim_scores': [],
-            'psnr_scores': [],
-        }
-        
+        results = {'ssim_scores': [], 'psnr_scores': []}
+
         with torch.no_grad():
-            for i, (real_images, _) in enumerate(tqdm(self.test_loader, desc="Quality Metrics")):
-                real_images = real_images.to(self.device)
+            # FIX 6: Unpack consistently — test loader returns (images, metadata/labels)
+            for i, batch in enumerate(tqdm(self.test_loader, desc="Quality Metrics")):
+                real_images = batch[0].to(self.device)
                 batch_size = real_images.size(0)
-                
-                # Generate fake images
+
                 fake_images = self.gan.generate(num_samples=batch_size)
-                
-                # Calculate metrics
-                ssim_val, psnr_val = metrics_calc.calculate_ssim_psnr(
-                    real_images, fake_images
-                )
-                
+
+                ssim_val, psnr_val = metrics_calc.calculate_ssim_psnr(real_images, fake_images)
                 results['ssim_scores'].append(ssim_val)
                 results['psnr_scores'].append(psnr_val)
-                
-                # Limit evaluation to reasonable number of batches
+
                 if i >= 20:
                     break
-        
-        # Aggregate results
-        results['avg_ssim'] = np.mean(results['ssim_scores'])
-        results['std_ssim'] = np.std(results['ssim_scores'])
-        results['avg_psnr'] = np.mean(results['psnr_scores'])
-        results['std_psnr'] = np.std(results['psnr_scores'])
-        
+
+        results['avg_ssim'] = float(np.mean(results['ssim_scores']))
+        results['std_ssim'] = float(np.std(results['ssim_scores']))
+        results['avg_psnr'] = float(np.mean(results['psnr_scores']))
+        results['std_psnr'] = float(np.std(results['psnr_scores']))
+
         return results
-    
+
     def _evaluate_authentication(self) -> Dict:
-        """Evaluate authentication performance"""
-        metrics_calc = VeinMetrics(device=self.device)
+        """
+        Evaluate authentication performance.
+
+        FIX 3: person_id values from metadata are remapped through
+        self.person_id_to_idx so they match the classifier's 0-indexed outputs.
+        Handles both dict metadata and plain label tensors.
+        """
         results = {
             'predictions': [],
             'labels': [],
             'correct': 0,
             'total': 0
         }
-        
+
         with torch.no_grad():
-            for images, metadata in tqdm(self.test_loader, desc="Authentication"):
-                images = images.to(self.device)
-                
-                # Get predictions
+            for batch in tqdm(self.test_loader, desc="Authentication"):
+                images = batch[0].to(self.device)
+
+                # FIX 6: Handle both dict metadata and plain label tensors
+                raw_metadata = batch[1]
+                if isinstance(raw_metadata, dict):
+                    raw_ids = raw_metadata['person_id']
+                else:
+                    raw_ids = raw_metadata.tolist()
+
+                # FIX 3: Remap raw person_ids to 0-indexed classifier labels
+                label_indices = [self._resolve_label(pid) for pid in raw_ids]
+                labels = torch.tensor(label_indices, device=self.device, dtype=torch.long)
+
                 outputs = self.classifier(images)
                 predictions = torch.argmax(outputs, dim=1)
-                labels = torch.tensor(
-                    [metadata['person_id'][i] for i in range(len(metadata['person_id']))],
-                    device=self.device
-                )
-                
-                # Calculate accuracy
+
                 results['correct'] += (predictions == labels).sum().item()
                 results['total'] += labels.size(0)
-                
-                results['predictions'].extend(predictions.cpu().numpy())
-                results['labels'].extend(labels.cpu().numpy())
-        
-        results['accuracy'] = results['correct'] / results['total'] if results['total'] > 0 else 0
-        
-        # Calculate EER if we have binary verification data
-        # Note: This would require pair-wise verification setup
-        
+                results['predictions'].extend(predictions.cpu().numpy().tolist())
+                results['labels'].extend(label_indices)
+
+        results['accuracy'] = (
+            results['correct'] / results['total'] if results['total'] > 0 else 0.0
+        )
+
         return results
-    
+
     def _evaluate_fairness(self) -> Dict:
-        """Evaluate fairness across demographic groups"""
         fairness_analyzer = VeinFairnessAnalyzer(self.classifier)
-        
+
         group_results, fairness_metrics = fairness_analyzer.evaluate_fairness(
             self.test_loader,
             device=self.device
         )
-        
-        results = {
+
+        return {
             'group_performance': group_results,
             'fairness_metrics': fairness_metrics
         }
-        
-        return results
-    
+
     def _generate_comparisons(self):
-        """Generate visual comparisons between real and fake images"""
-        # Get a batch of real images
-        real_images, _ = next(iter(self.test_loader))
-        real_images = real_images.to(self.device)
-        
-        # Generate fake images
+        # FIX 6: Safe unpacking regardless of metadata format
+        batch = next(iter(self.test_loader))
+        real_images = batch[0].to(self.device)
+
         with torch.no_grad():
             fake_images = self.gan.generate(num_samples=real_images.size(0))
-        
-        # Save comparison
+
         save_path = config.RESULTS_DIR / 'comparisons' / 'real_vs_fake.png'
         compare_real_fake(real_images[:16], fake_images[:16], save_path=save_path)
-        
         print(f"✓ Visual comparison saved: {save_path}")
-    
+
+    # ==================== Generate ====================
+
     def generate_mode(self):
-        """Generation mode - generates synthetic vein images"""
         print("\n" + "="*60)
         print("GENERATION MODE")
         print("="*60 + "\n")
-        
+
         num_samples = self.args.num_samples
         print(f"Generating {num_samples} synthetic vein images...")
-        
+
         self.gan.generator.eval()
-        
+
         with torch.no_grad():
-            # Generate in batches to avoid memory issues
             batch_size = 32
             all_images = []
-            
+
             for i in tqdm(range(0, num_samples, batch_size)):
                 current_batch_size = min(batch_size, num_samples - i)
                 fake_images = self.gan.generate(num_samples=current_batch_size)
                 all_images.append(fake_images)
-            
+
             all_images = torch.cat(all_images, dim=0)
-        
-        # Save images
+
         output_path = config.RESULTS_DIR / 'generated' / f'synthetic_samples_{num_samples}.png'
         save_image(
-            (all_images + 1) / 2,  # Denormalize
+            (all_images + 1) / 2,
             output_path,
             nrow=int(np.sqrt(num_samples)),
             padding=2
         )
-        
+
         print(f"\n✓ Generated {num_samples} images")
         print(f"✓ Saved to: {output_path}")
-        
-        # Save individual images if requested
+
         if self.args.save_individual:
             print("\nSaving individual images...")
             for i, img in enumerate(tqdm(all_images)):
                 img_path = config.RESULTS_DIR / 'generated' / f'sample_{i:04d}.png'
                 save_image((img + 1) / 2, img_path)
-    
+
+    # ==================== XAI ====================
+
     def xai_mode(self):
-        """Explainability mode - generates XAI visualizations"""
         print("\n" + "="*60)
         print("EXPLAINABILITY (XAI) MODE")
         print("="*60 + "\n")
-        
+
         self.classifier.eval()
-        
-        # Get sample images
-        images, metadata = next(iter(self.test_loader))
-        images = images.to(self.device)
+
+        # FIX 6: Safe unpacking — ignore metadata here, we only need images
+        batch = next(iter(self.test_loader))
+        images = batch[0].to(self.device)
         num_samples = min(self.args.num_samples, len(images))
-        
-        # 1. Grad-CAM Analysis
+
         print("1. Running Grad-CAM Analysis...")
         self._run_gradcam(images[:num_samples], num_samples)
-        
-        # 2. SHAP Analysis
+
         print("\n2. Running SHAP Analysis...")
         self._run_shap(images, num_samples)
-        
-        # 3. LIME Analysis
+
         print("\n3. Running LIME Analysis...")
         self._run_lime(images[:num_samples], num_samples)
-        
+
         print("\n" + "="*60)
         print("✓ XAI analysis completed!")
         print(f"✓ Results saved in: {config.RESULTS_DIR / 'xai'}")
         print("="*60)
-    
+
     def _run_gradcam(self, images: torch.Tensor, num_samples: int):
-        """Run Grad-CAM analysis"""
-        gradcam = GradCAM(self.classifier, target_layer=config.GRADCAM_TARGET_LAYER)
-        
+        """
+        Run Grad-CAM analysis.
+        FIX 4: Use GRADCAM_TARGET_LAYER = 'conv4' which matches the actual
+        layer names in VeinAuthenticationClassifier, not 'layer4' from config.
+        """
+        gradcam = GradCAM(self.classifier, target_layer=GRADCAM_TARGET_LAYER)
+
         for i in tqdm(range(num_samples), desc="Grad-CAM"):
             try:
                 cam, output, pred = gradcam.generate_cam(images[i:i+1])
                 save_path = config.RESULTS_DIR / 'xai' / 'gradcam' / f'gradcam_{i:03d}.png'
                 gradcam.visualize(images[i:i+1], cam, save_path=save_path)
-                plt.close()  # Close to avoid memory leaks
+                plt.close()
             except Exception as e:
                 print(f"  ⚠ Warning: Grad-CAM failed for sample {i}: {e}")
-    
+
     def _run_shap(self, images: torch.Tensor, num_samples: int):
-        """Run SHAP analysis"""
         try:
             background = images[:min(config.SHAP_BACKGROUND_SIZE, len(images))]
             shap_analyzer = VeinSHAPAnalyzer(
@@ -380,7 +454,7 @@ class XAIVeinGANPipeline:
                 device=self.device
             )
             shap_analyzer.create_explainer(method='gradient')
-            
+
             for i in tqdm(range(num_samples), desc="SHAP"):
                 try:
                     shap_vals, pred = shap_analyzer.explain_instance(images[i:i+1])
@@ -395,23 +469,30 @@ class XAIVeinGANPipeline:
                     print(f"  ⚠ Warning: SHAP failed for sample {i}: {e}")
         except Exception as e:
             print(f"  ⚠ Warning: SHAP initialization failed: {e}")
-    
+
     def _run_lime(self, images: torch.Tensor, num_samples: int):
-        """Run LIME analysis"""
+        """
+        Run LIME analysis.
+        FIX 5: Pass segments as the required 4th argument to visualize_explanation.
+        The original call was missing segments, causing a TypeError every time.
+        """
         try:
             lime_analyzer = VeinLIMEAnalyzer(self.classifier, device=self.device)
-            
+
             for i in tqdm(range(num_samples), desc="LIME"):
                 try:
-                    exp, pred, _ = lime_analyzer.explain_instance(
+                    # explain_instance returns (explanation, pred_class, segments)
+                    exp, pred, segments = lime_analyzer.explain_instance(
                         images[i:i+1],
                         num_samples=config.LIME_NUM_SAMPLES
                     )
                     save_path = config.RESULTS_DIR / 'xai' / 'lime' / f'lime_{i:03d}.png'
+                    # FIX 5: segments is now correctly passed as 4th argument
                     lime_analyzer.visualize_explanation(
                         images[i:i+1],
                         exp,
                         pred,
+                        segments,          # <-- was missing in original
                         save_path=save_path
                     )
                     plt.close()
@@ -419,16 +500,17 @@ class XAIVeinGANPipeline:
                     print(f"  ⚠ Warning: LIME failed for sample {i}: {e}")
         except Exception as e:
             print(f"  ⚠ Warning: LIME initialization failed: {e}")
-    
+
+    # ==================== Utilities ====================
+
     def _save_results(self, results: Dict, filename: str):
-        """Save evaluation results to file"""
         output_path = config.RESULTS_DIR / 'metrics' / filename
-        
+
         with open(output_path, 'w') as f:
             f.write("="*60 + "\n")
             f.write(f"Results: {filename}\n")
             f.write("="*60 + "\n\n")
-            
+
             for key, value in results.items():
                 if isinstance(value, (list, np.ndarray)):
                     f.write(f"{key}: [array of {len(value)} items]\n")
@@ -438,27 +520,31 @@ class XAIVeinGANPipeline:
                         f.write(f"  {k}: {v}\n")
                 else:
                     f.write(f"{key}: {value}\n")
-        
+
         print(f"  ✓ Saved: {output_path}")
-    
+
     def _print_summary(self, quality_results: Dict, auth_results: Dict, fairness_results: Dict):
-        """Print evaluation summary"""
         print(f"\nQuality Metrics:")
         print(f"  SSIM: {quality_results['avg_ssim']:.4f} ± {quality_results['std_ssim']:.4f}")
         print(f"  PSNR: {quality_results['avg_psnr']:.2f} ± {quality_results['std_psnr']:.2f} dB")
-        
+
         print(f"\nAuthentication Performance:")
-        print(f"  Accuracy: {auth_results['accuracy']:.4f} ({auth_results['correct']}/{auth_results['total']})")
-        
+        print(f"  Accuracy: {auth_results['accuracy']:.4f} "
+              f"({auth_results['correct']}/{auth_results['total']})")
+
         print(f"\nFairness Analysis:")
         for group, metrics in fairness_results['group_performance'].items():
-            print(f"  {group}: Accuracy = {metrics['accuracy']:.4f}, Samples = {metrics['sample_size']}")
-        
+            print(f"  {group}: Accuracy = {metrics['accuracy']:.4f}, "
+                  f"Samples = {metrics['sample_size']}")
+
         if fairness_results['fairness_metrics']:
             print(f"\n  Fairness Metrics:")
             for metric, value in fairness_results['fairness_metrics'].items():
-                print(f"    {metric}: {value:.4f}")
+                if isinstance(value, float):
+                    print(f"    {metric}: {value:.4f}")
 
+
+# ==================== Entry Point ====================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -479,8 +565,7 @@ Examples:
   python main.py --mode xai --checkpoint checkpoints/best_model.pth --num_samples 20
         """
     )
-    
-    # Mode selection
+
     parser.add_argument(
         "--mode",
         type=str,
@@ -488,65 +573,53 @@ Examples:
         choices=["train", "evaluate", "generate", "xai"],
         help="Mode of operation"
     )
-    
-    # Model checkpoint
     parser.add_argument(
         "--checkpoint",
         type=str,
         default=None,
         help="Path to model checkpoint"
     )
-    
-    # Generation parameters
     parser.add_argument(
         "--num_samples",
         type=int,
         default=10,
         help="Number of samples for generation/analysis"
     )
-    
     parser.add_argument(
         "--save_individual",
         action="store_true",
         help="Save individual generated images"
     )
-    
-    # Training parameters (override config)
     parser.add_argument(
         "--epochs",
         type=int,
         default=None,
         help="Number of training epochs (overrides config)"
     )
-    
     parser.add_argument(
         "--batch_size",
         type=int,
         default=None,
         help="Batch size (overrides config)"
     )
-    
-    # Evaluation parameters
     parser.add_argument(
         "--eval_metrics",
         nargs='+',
         default=None,
         help="Specific metrics to evaluate"
     )
-    
+
     args = parser.parse_args()
-    
-    # Override config if specified
+
     if args.epochs is not None:
         config.NUM_EPOCHS = args.epochs
     if args.batch_size is not None:
         config.BATCH_SIZE = args.batch_size
-    
+
     try:
-        # Initialize and run pipeline
         pipeline = XAIVeinGANPipeline(args)
         pipeline.run()
-        
+
     except KeyboardInterrupt:
         print("\n\n⚠ Interrupted by user")
         sys.exit(0)
